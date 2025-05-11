@@ -6157,7 +6157,8 @@ struct janus_plugin_result *janus_audiobridge_handle_message(janus_plugin_sessio
 		goto plugin_response;
 	} else if(!strcasecmp(request_text, "join") || !strcasecmp(request_text, "configure")
 			|| !strcasecmp(request_text, "changeroom") || !strcasecmp(request_text, "leave")
-			|| !strcasecmp(request_text, "hangup")) {
+			|| !strcasecmp(request_text, "hangup")
+			|| !strcasecmp(request_text, "button_event")) {
 		/* These messages are handled asynchronously */
 		janus_audiobridge_message *msg = g_malloc(sizeof(janus_audiobridge_message));
 		msg->handle = handle;
@@ -8081,6 +8082,63 @@ static void *janus_audiobridge_handler(void *data) {
 				/* Only decrease the counter if we were still there */
 				janus_refcount_decrease(&audiobridge->ref);
 			}
+		} else if (!strcasecmp(request_text, "button_event"))	{
+			janus_mutex_unlock(&sessions_mutex);
+
+			janus_audiobridge_participant *participant = (janus_audiobridge_participant *)session->participant;
+			if (participant == NULL || participant->room == NULL)
+			{
+				JANUS_LOG(LOG_ERR, "Can't handle button_event (not in a room)\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NOT_JOINED;
+				g_snprintf(error_cause, 512, "Can't handle button_event (not in a room)");
+				goto error;
+			}
+
+			json_t *state = json_object_get(root, "state");
+			const char *state_text = json_string_value(state);
+			if (!state_text || (strcasecmp(state_text, "down") && strcasecmp(state_text, "up")))
+			{
+				JANUS_LOG(LOG_ERR, "Invalid or missing state value in button_event\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_INVALID_REQUEST;
+				g_snprintf(error_cause, 512, "Invalid or missing state (expected 'down' or 'up')");
+				goto error;
+			}
+
+			JANUS_LOG(LOG_VERB, "[AudioBridge] button_event from %s: %s\n",
+					  participant->display ? participant->display : "(no display)", state_text);
+
+			// Broadcast to others
+			janus_audiobridge_room *room = participant->room;
+			if (room != NULL)
+			{
+				janus_mutex_lock(&room->mutex);
+				GHashTableIter iter;
+				gpointer value;
+				g_hash_table_iter_init(&iter, room->participants);
+				while (g_hash_table_iter_next(&iter, NULL, &value))
+				{
+					janus_audiobridge_participant *p = value;
+					if (p == participant)
+						continue;
+
+					json_t *event = json_object();
+					json_object_set_new(event, "audiobridge", json_string("button_event"));
+					if (string_ids)
+						json_object_set_new(event, "id", json_string(participant->user_id_str));
+					else
+						json_object_set_new(event, "id", json_integer(participant->user_id));
+					if (participant->display)
+						json_object_set_new(event, "display", json_string(participant->display));
+					json_object_set_new(event, "state", json_string(state_text));
+					gateway->push_event(p->session->handle, &janus_audiobridge_plugin, NULL, event, NULL);
+					json_decref(event);
+				}
+				janus_mutex_unlock(&room->mutex);
+			}
+
+			event = json_object();
+			json_object_set_new(event, "audiobridge", json_string("event"));
+			json_object_set_new(event, "button_event", json_string("ok"));
 		} else {
 			janus_mutex_unlock(&sessions_mutex);
 			JANUS_LOG(LOG_ERR, "Unknown request '%s'\n", request_text);
